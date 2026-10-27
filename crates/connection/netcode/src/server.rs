@@ -1121,10 +1121,19 @@ impl<Ctx> Server<Ctx> {
         entity: Entity,
         sender: &mut LinkSender,
     ) -> Result<()> {
-        let Some(client_id) = self.conn_cache.client_id_map.get(&entity) else {
+        // Retire even stale aliases: another address may have replaced this id.
+        let Some(client_id) = self.conn_cache.client_id_map.remove(&entity) else {
             return Err(Error::EntityNotFound(entity));
         };
-        self.disconnect(*client_id, sender)
+        if !self
+            .conn_cache
+            .clients
+            .get(&client_id)
+            .is_some_and(|conn| conn.entity == entity)
+        {
+            return Err(Error::EntityNotFound(entity));
+        }
+        self.disconnect(client_id, sender)
     }
 
     /// Disconnects all clients.
@@ -1376,6 +1385,39 @@ mod tests {
                 .disconnections
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_stale_entity_cannot_disconnect_the_replacement_client() {
+        let mut server = Server::new(1, [0; PRIVATE_KEY_BYTES]).unwrap();
+        let mut world = World::new();
+        let old = world.spawn_empty().id();
+        let replacement = world.spawn_empty().id();
+        for entity in [old, replacement] {
+            server.conn_cache.add(
+                1,
+                entity,
+                -1,
+                [1; PRIVATE_KEY_BYTES],
+                [2; PRIVATE_KEY_BYTES],
+                [0; USER_DATA_BYTES],
+            );
+        }
+        server.conn_cache.mut_by_id(1).unwrap().connect();
+        let mut sender = LinkSender::default();
+        assert!(
+            matches!(server.disconnect_by_entity(old, &mut sender), Err(Error::EntityNotFound(e)) if e == old)
+        );
+        assert!(!server.conn_cache.client_id_map.contains_key(&old));
+        assert_eq!(server.client_entity(1), Some(replacement));
+        assert_eq!(server.num_connected_clients(), 1);
+        assert_eq!(sender.len(), 0);
+        server
+            .disconnect_by_entity(replacement, &mut sender)
+            .unwrap();
+        assert!(server.conn_cache.clients.is_empty());
+        assert!(server.conn_cache.client_id_map.is_empty());
+        assert!(server.conn_cache.replay_protection.is_empty());
     }
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
