@@ -35,13 +35,14 @@ server = [
 trace = []
 
 [dependencies]
-# local crates
-lightyear_connection.workspace = true
-lightyear_core.workspace = true
-lightyear_link.workspace = true
-lightyear_transport = { workspace = true, optional = true }
-lightyear_serde.workspace = true
-lightyear_utils.workspace = true
+# Registry siblings let consumers patch just this crate without duplicating
+# the rest of the lightyear workspace.
+lightyear_connection = { version = "0.30.1", default-features = false }
+lightyear_core = { version = "0.30.1", default-features = false }
+lightyear_link = { version = "0.30.1", default-features = false }
+lightyear_transport = { version = "0.30.1", default-features = false, optional = true }
+lightyear_serde = { version = "0.30.1", default-features = false }
+lightyear_utils = { version = "0.30.1", default-features = false }
 
 # bevy
 bevy_app.workspace = true
@@ -64,7 +65,7 @@ chacha20poly1305.workspace = true
 web-time.workspace = true
 
 [dev-dependencies]
-lightyear_serde = { workspace = true, features = ["std"] }
+lightyear_serde = { version = "0.30.1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

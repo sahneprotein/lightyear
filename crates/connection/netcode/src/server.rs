@@ -1252,6 +1252,85 @@ mod tests {
         assert!(inner.cfg.context.disconnections.is_empty());
     }
 
+    #[test]
+    fn app_disconnect_releases_netcode_state_before_despawn() {
+        use bevy_app::{Last, PostUpdate, PreUpdate};
+        use bevy_ecs::error::{FallbackErrorHandler, panic};
+        use bevy_time::{Real, Time};
+        use lightyear_connection::{
+            client::{Connected, Disconnecting},
+            client_of::ClientOf,
+        };
+        use lightyear_core::id::{LocalId, PeerId, RemoteId};
+        use lightyear_link::prelude::LinkOf;
+
+        let mut app = App::new();
+        app.add_plugins(NetcodeServerPlugin);
+        app.insert_resource(Time::<Real>::default());
+        app.insert_resource(FallbackErrorHandler(panic));
+        let server = app
+            .world_mut()
+            .spawn(NetcodeServer::new(
+                NetcodeConfig::default().with_max_clients(1),
+            ))
+            .id();
+        let client = app
+            .world_mut()
+            .spawn((
+                Link::default(),
+                LinkOf { server },
+                ClientOf,
+                Connected,
+                LocalId(PeerId::Server),
+                RemoteId(PeerId::Netcode(1)),
+            ))
+            .id();
+        {
+            let mut netcode = app.world_mut().get_mut::<NetcodeServer>(server).unwrap();
+            let inner = &mut netcode.inner;
+            inner.conn_cache.add(
+                1,
+                client,
+                -1,
+                [1; PRIVATE_KEY_BYTES],
+                [2; PRIVATE_KEY_BYTES],
+                [0; USER_DATA_BYTES],
+            );
+            inner.conn_cache.mut_by_id(1).unwrap().connect();
+            inner
+                .send_queue
+                .insert(client, vec![SendPayload::from_static(&[4])]);
+        }
+        app.world_mut().entity_mut(client).insert(Disconnecting);
+        assert!(app.world().get::<Connected>(client).is_none());
+        app.world_mut().run_schedule(PostUpdate);
+        let netcode = app.world().get::<NetcodeServer>(server).unwrap();
+        assert_eq!(netcode.inner.num_connected_clients(), 0);
+        assert!(netcode.inner.conn_cache.clients.is_empty());
+        assert!(netcode.inner.conn_cache.client_id_map.is_empty());
+        assert!(netcode.inner.conn_cache.replay_protection.is_empty());
+        assert!(netcode.inner.send_queue.is_empty());
+        assert_eq!(app.world().get::<Link>(client).unwrap().send.len(), 10);
+        // Repeated sends (including Stop's already-disconnected path) are harmless.
+        app.world_mut().run_schedule(PostUpdate);
+        assert_eq!(app.world().get::<Link>(client).unwrap().send.len(), 10);
+        app.world_mut().run_schedule(Last);
+        assert!(app.world().get_entity(client).is_err());
+        // The queued callback runs after Last already removed the entity.
+        // FallbackErrorHandler(panic) turns a stale despawn warning into failure.
+        app.world_mut().run_schedule(PreUpdate);
+        assert!(
+            app.world()
+                .get::<NetcodeServer>(server)
+                .unwrap()
+                .inner
+                .cfg
+                .context
+                .disconnections
+                .is_empty()
+        );
+    }
+
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
     const TEST_PRIVATE_KEY: Key = [0x42; PRIVATE_KEY_BYTES];
 

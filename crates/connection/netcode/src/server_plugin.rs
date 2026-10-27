@@ -216,8 +216,20 @@ impl NetcodeServerPlugin {
                         // TODO: we can be here while the link has been established, but the client is not yet connected
                         //  so the PeerId is not Netcode! I think we should just error?
 
-                        // If the client was connected, it has a Netcode client_id
-                        if connected.is_some() {
+                        if disconnecting.is_some() {
+                            // Disconnecting removes Connected. Release the netcode slot and id
+                            // before ConnectionPlugin despawns this link in Last, and leave the
+                            // disconnect packets available for LinkSystems::Send this frame.
+                            // Stop may already have disconnected it, so a missing entry is fine.
+                            if let Err(e) = netcode_server
+                                .inner
+                                .disconnect_by_entity(entity, &mut link.send)
+                                && !matches!(e, crate::Error::EntityNotFound(_))
+                            {
+                                error!("Error disconnecting client: {:?}", e);
+                            }
+                        } else if connected.is_some() {
+                            // If the client was connected, it has a Netcode client_id.
                             if let Some(PeerId::Netcode(client_id)) = remote_id.map(|x| x.0) {
                                 for _ in 0..link.send.len() {
                                     if let Some(payload) = link.send.pop() {
@@ -248,12 +260,7 @@ impl NetcodeServerPlugin {
                         } else {
                             // if the client is not connected, remove any messages buffered in link.send
                             // We don't want to allow users to send messages while not connected
-                            //
-                            // However if we are disconnecting, we still want to send the disconnect packets
-                            // (we don't use `send_netcode_packets` because we need to remove the client from `send_queue`)
-                            if disconnecting.is_none() {
-                                link.send.drain();
-                            }
+                            link.send.drain();
                         }
 
                         // even if it was not connected, we might need to send the netcode packets that were buffered
@@ -396,7 +403,7 @@ impl NetcodeServerPlugin {
                                 .try_insert(Disconnected {
                                     reason: DisconnectedReason::ByPeer(None),
                                 })
-                                .despawn();
+                                .try_despawn();
                         });
                     if stopping {
                         // after we sent disconnection packets, we can stop the server transport
