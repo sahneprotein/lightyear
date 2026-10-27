@@ -181,9 +181,6 @@ impl ConnectionCache {
         let Some(conn) = self.clients.get(&client_id) else {
             return;
         };
-        if !conn.is_connected() {
-            return;
-        }
         self.client_id_map.remove(&conn.entity);
         self.replay_protection.remove(&client_id);
         self.clients.remove(&client_id);
@@ -1133,7 +1130,16 @@ impl<Ctx> Server<Ctx> {
         {
             return Err(Error::EntityNotFound(entity));
         }
-        self.disconnect(client_id, sender)
+        if self.conn_cache.clients[&client_id].is_connected() {
+            self.disconnect(client_id, sender)
+        } else {
+            // No challenge response was accepted, so there is no established
+            // connection to notify. Drop the encryption/replay state and any
+            // queued challenge; the client can retry its connection request.
+            self.conn_cache.remove(client_id);
+            self.send_queue.remove(&entity);
+            Ok(())
+        }
     }
 
     /// Disconnects all clients.
@@ -1263,15 +1269,20 @@ mod tests {
 
     #[test]
     fn app_disconnect_releases_netcode_state_before_despawn() {
-        disconnect_sends_only_netcode_packets(false);
+        disconnect_sends_only_netcode_packets(false, false);
     }
 
     #[test]
     fn stop_discards_transport_payloads_before_sending_disconnects() {
-        disconnect_sends_only_netcode_packets(true);
+        disconnect_sends_only_netcode_packets(true, false);
     }
 
-    fn disconnect_sends_only_netcode_packets(stop: bool) {
+    #[test]
+    fn pending_app_disconnect_releases_netcode_state_before_despawn() {
+        disconnect_sends_only_netcode_packets(false, true);
+    }
+
+    fn disconnect_sends_only_netcode_packets(stop: bool, pending: bool) {
         use bevy_app::{Last, PostUpdate, PreUpdate};
         use bevy_ecs::error::{FallbackErrorHandler, panic};
         use bevy_time::{Real, Time};
@@ -1298,11 +1309,13 @@ mod tests {
                 Link::default(),
                 LinkOf { server },
                 ClientOf,
-                Connected,
                 LocalId(PeerId::Server),
                 RemoteId(PeerId::Netcode(1)),
             ))
             .id();
+        if !pending {
+            app.world_mut().entity_mut(client).insert(Connected);
+        }
         {
             let mut netcode = app.world_mut().get_mut::<NetcodeServer>(server).unwrap();
             let inner = &mut netcode.inner;
@@ -1314,7 +1327,9 @@ mod tests {
                 [2; PRIVATE_KEY_BYTES],
                 [0; USER_DATA_BYTES],
             );
-            inner.conn_cache.mut_by_id(1).unwrap().connect();
+            if !pending {
+                inner.conn_cache.mut_by_id(1).unwrap().connect();
+            }
             inner
                 .send_queue
                 .insert(client, vec![SendPayload::from_static(&[4])]);
@@ -1342,7 +1357,10 @@ mod tests {
         assert!(netcode.inner.conn_cache.client_id_map.is_empty());
         assert!(netcode.inner.conn_cache.replay_protection.is_empty());
         assert!(netcode.inner.send_queue.is_empty());
-        assert_eq!(app.world().get::<Link>(client).unwrap().send.len(), 10);
+        assert_eq!(
+            app.world().get::<Link>(client).unwrap().send.len(),
+            if pending { 0 } else { 10 }
+        );
         let protocol_id = app
             .world()
             .get::<NetcodeServer>(server)
@@ -1418,6 +1436,39 @@ mod tests {
         assert!(server.conn_cache.clients.is_empty());
         assert!(server.conn_cache.client_id_map.is_empty());
         assert!(server.conn_cache.replay_protection.is_empty());
+    }
+
+    #[test]
+    fn pending_connection_cleanup_releases_id_replay_state_and_challenge() {
+        let address: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let (mut server, _world, entity) = process_request(Some(address), &[address], None);
+        assert_eq!(server.conn_cache.clients.len(), 1);
+        assert_eq!(server.conn_cache.replay_protection.len(), 1);
+        assert!(!server.conn_cache.find_by_id(1).unwrap().is_connected());
+        assert!(server.send_queue.contains_key(&entity));
+        let mut sender = LinkSender::default();
+        server.disconnect_by_entity(entity, &mut sender).unwrap();
+        assert!(server.conn_cache.clients.is_empty());
+        assert!(server.conn_cache.client_id_map.is_empty());
+        assert!(server.conn_cache.replay_protection.is_empty());
+        assert!(!server.send_queue.contains_key(&entity));
+        // Before the challenge response there is no connection to notify.
+        assert_eq!(sender.len(), 0);
+        assert!(matches!(
+            server.disconnect_by_entity(entity, &mut sender),
+            Err(Error::EntityNotFound(_))
+        ));
+        // The same id can start again after its half-open attempt was removed.
+        let replacement = Entity::from_bits(123);
+        server.conn_cache.add(
+            1,
+            replacement,
+            -1,
+            [1; PRIVATE_KEY_BYTES],
+            [2; PRIVATE_KEY_BYTES],
+            [0; USER_DATA_BYTES],
+        );
+        assert_eq!(server.client_entity(1), Some(replacement));
     }
 
     const TEST_PROTOCOL_ID: u64 = 0x1122334455667788;
