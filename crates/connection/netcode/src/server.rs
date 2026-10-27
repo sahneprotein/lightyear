@@ -1254,6 +1254,15 @@ mod tests {
 
     #[test]
     fn app_disconnect_releases_netcode_state_before_despawn() {
+        disconnect_sends_only_netcode_packets(false);
+    }
+
+    #[test]
+    fn stop_discards_transport_payloads_before_sending_disconnects() {
+        disconnect_sends_only_netcode_packets(true);
+    }
+
+    fn disconnect_sends_only_netcode_packets(stop: bool) {
         use bevy_app::{Last, PostUpdate, PreUpdate};
         use bevy_ecs::error::{FallbackErrorHandler, panic};
         use bevy_time::{Real, Time};
@@ -1301,7 +1310,21 @@ mod tests {
                 .send_queue
                 .insert(client, vec![SendPayload::from_static(&[4])]);
         }
-        app.world_mut().entity_mut(client).insert(Disconnecting);
+        if stop {
+            app.world_mut()
+                .trigger(lightyear_connection::server::Stop { entity: server });
+            app.world_mut().flush();
+        } else {
+            app.world_mut().entity_mut(client).insert(Disconnecting);
+        }
+        // TransportSystems::Send can enqueue plaintext even after Stop removed Connected.
+        app.world_mut()
+            .get_mut::<Link>(client)
+            .unwrap()
+            .send
+            .push(SendPayload::from_static(
+                b"plaintext replication / ack / reject",
+            ));
         assert!(app.world().get::<Connected>(client).is_none());
         app.world_mut().run_schedule(PostUpdate);
         let netcode = app.world().get::<NetcodeServer>(server).unwrap();
@@ -1311,9 +1334,33 @@ mod tests {
         assert!(netcode.inner.conn_cache.replay_protection.is_empty());
         assert!(netcode.inner.send_queue.is_empty());
         assert_eq!(app.world().get::<Link>(client).unwrap().send.len(), 10);
-        // Repeated sends (including Stop's already-disconnected path) are harmless.
+        let protocol_id = app
+            .world()
+            .get::<NetcodeServer>(server)
+            .unwrap()
+            .inner
+            .protocol_id;
+        for payload in app
+            .world_mut()
+            .get_mut::<Link>(client)
+            .unwrap()
+            .send
+            .drain()
+        {
+            let packet = Packet::read(
+                payload.into(),
+                protocol_id,
+                0,
+                [1; PRIVATE_KEY_BYTES],
+                None,
+                1 << Packet::DISCONNECT,
+            )
+            .unwrap();
+            assert!(matches!(packet, Packet::Disconnect(_)));
+        }
+        // A later send has no stale plaintext or duplicate disconnect packets.
         app.world_mut().run_schedule(PostUpdate);
-        assert_eq!(app.world().get::<Link>(client).unwrap().send.len(), 10);
+        assert_eq!(app.world().get::<Link>(client).unwrap().send.len(), 0);
         app.world_mut().run_schedule(Last);
         assert!(app.world().get_entity(client).is_err());
         // The queued callback runs after Last already removed the entity.

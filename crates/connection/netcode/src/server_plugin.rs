@@ -217,6 +217,9 @@ impl NetcodeServerPlugin {
                         //  so the PeerId is not Netcode! I think we should just error?
 
                         if disconnecting.is_some() {
+                            // TransportSystems::Send still runs for Linked links. Never let
+                            // its plaintext payloads bypass netcode on the disconnect path.
+                            link.send.drain();
                             // Disconnecting removes Connected. Release the netcode slot and id
                             // before ConnectionPlugin despawns this link in Last, and leave the
                             // disconnect packets available for LinkSystems::Send this frame.
@@ -433,9 +436,9 @@ impl NetcodeServerPlugin {
     fn stop(
         trigger: On<Stop>,
         mut commands: Commands,
-        mut query: Query<(Entity, &mut NetcodeServer, &Server), Without<Stopped>>,
+        query: Query<(Entity, &NetcodeServer, &Server), Without<Stopped>>,
         mut link_query: Query<
-            (Entity, &mut Link, &RemoteId),
+            (Entity, &RemoteId),
             (
                 With<ClientOf>,
                 With<Connected>,
@@ -444,7 +447,7 @@ impl NetcodeServerPlugin {
             ),
         >,
     ) -> Result {
-        if let Ok((server_entity, mut netcode_server, server)) = query.get_mut(trigger.entity) {
+        if let Ok((server_entity, _, server)) = query.get(trigger.entity) {
             info!("Stopping netcode server");
 
             commands.entity(server_entity).insert(Stopping);
@@ -453,14 +456,13 @@ impl NetcodeServerPlugin {
             let unique_slice =
                 unsafe { UniqueEntitySlice::from_slice_unchecked(server.collection()) };
             link_query.iter_many_unique_mut(unique_slice).try_for_each(
-                |(entity, mut link, remote_peer_id)| {
-                    let PeerId::Netcode(client_id) = remote_peer_id.0 else {
+                |(entity, remote_peer_id)| {
+                    let PeerId::Netcode(_) = remote_peer_id.0 else {
                         error!("Client {:?} is not a Netcode client", remote_peer_id);
                         return Err(crate::error::Error::UnknownClient(remote_peer_id.0));
                     };
-                    // this will make sure that `netcode.on_disconnect` is called, so the entity will get disconnected
-                    // in the next frame from the `receive` system.
-                    netcode_server.inner.disconnect(client_id, &mut link.send)?;
+                    // Defer packet creation to Send, after discarding transport payloads.
+                    // This also queues the callback for Receive in the next frame.
                     commands.entity(entity).insert(Disconnecting);
                     Ok(())
                 },
